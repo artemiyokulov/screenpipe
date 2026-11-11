@@ -18,6 +18,8 @@ use parking_lot::Mutex;
 use screenpipe_core::pii_removal::remove_pii;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicPtr, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1055,7 +1057,10 @@ fn run_event_tap(
     let key_layout = Arc::new(ArcSwap::from_pointee(None));
     // Hold the watcher for the whole tap. Its Drop stops and joins the
     // snapshot thread, including the early return below when the tap fails
-    // to install. The thread is not the event-tap thread, so it may call TIS.
+    // to install. The watcher thread must not call TIS itself: on macOS 26+
+    // HIToolbox asserts the main queue inside `TSMGetInputSourceProperty`
+    // and SIGTRAPs the process (`_dispatch_assert_queue_fail` on the
+    // `key-layout` thread). The watcher hops each snapshot onto the main queue.
     let _layout_watcher = spawn_layout_watcher(stop.clone(), key_layout.clone());
 
     let state = Box::leak(Box::new(TapState {
@@ -2915,7 +2920,8 @@ fn truncate(s: &str, max: usize) -> String {
 ///
 /// The bytes are 4-byte aligned because `UCKeyTranslate` reads `UInt16` and
 /// `UInt32` fields out of them. The copy is what makes translation safe on the
-/// event-tap thread: that thread must not call Text Input Source APIs.
+/// event-tap thread: that thread, and the `key-layout` watcher thread, must
+/// not call Text Input Source APIs. Only the main queue may.
 struct OwnedKeyLayout {
     words: Vec<u32>,
     keyboard_type: u32,
@@ -2977,7 +2983,7 @@ fn watch_keyboard_layout(
     let mut stamp: Option<(String, u32)> = None;
     let mut warned = false;
     loop {
-        match snapshot_current_layout() {
+        match snapshot_current_layout_for_watcher() {
             Some(snapshot) => {
                 let next = (snapshot.source_id, snapshot.layout.keyboard_type);
                 if stamp.as_ref() != Some(&next) {
@@ -3014,6 +3020,81 @@ fn watch_keyboard_layout(
 
 fn layout_watch_should_stop(stop: &AtomicBool, session_stop: &AtomicBool) -> bool {
     stop.load(Ordering::Acquire) || session_stop.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    // Non-zero when the caller is the process main thread. Linked from
+    // libsystem; the `libc` crate is only a macOS dev-dependency.
+    fn pthread_main_np() -> i32;
+}
+
+/// How many main-queue hops may time out before this process stops trying.
+///
+/// The GUI app services the main queue, so the first hop normally returns
+/// immediately. The headless CLI and `cargo test` never do; giving up keeps
+/// the watcher from blocking two seconds forever. A few retries cover the
+/// window where the tap starts before tao's event loop is pumping.
+#[cfg(not(test))]
+const LAYOUT_MAIN_QUEUE_ATTEMPTS: u8 = 8;
+
+#[cfg(not(test))]
+static LAYOUT_MAIN_QUEUE_TIMEOUTS: AtomicU8 = AtomicU8::new(0);
+
+/// Snapshot the active layout for the background watcher.
+///
+/// HIToolbox input-source calls (`TISGetInputSourceProperty` →
+/// `TSMGetInputSourceProperty`) assert the main dispatch queue on macOS 26
+/// and later. Calling them on `key-layout` kills the app with SIGTRAP.
+/// The hop is `async` plus a bounded wait, same as clipboard reads: a
+/// `dispatch_sync` from this thread deadlocks if the main thread is joining
+/// the watcher during shutdown.
+fn snapshot_current_layout_for_watcher() -> Option<LayoutSnapshot> {
+    #[cfg(test)]
+    {
+        // libtest does not service the main queue; hopping would time out
+        // and the direct call is what the layout tests need on older macOS.
+        // On macOS 26+ those tests skip themselves instead of trapping.
+        snapshot_current_layout()
+    }
+
+    #[cfg(not(test))]
+    {
+        if unsafe { pthread_main_np() } != 0 {
+            return snapshot_current_layout();
+        }
+        if LAYOUT_MAIN_QUEUE_TIMEOUTS.load(Ordering::Acquire) >= LAYOUT_MAIN_QUEUE_ATTEMPTS {
+            return None;
+        }
+        let inflight = std::env::temp_dir().join(format!(
+            "screenpipe-key-layout-{}",
+            std::process::id()
+        ));
+        match bounded_dispatch(
+            Duration::from_secs(2),
+            inflight,
+            |job| cidre::dispatch::Queue::main().async_once(job),
+            snapshot_current_layout,
+        ) {
+            BoundedDispatch::Completed(snapshot) => {
+                LAYOUT_MAIN_QUEUE_TIMEOUTS.store(0, Ordering::Release);
+                snapshot
+            }
+            BoundedDispatch::TimedOut => {
+                let timeouts = LAYOUT_MAIN_QUEUE_TIMEOUTS
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1);
+                if timeouts == 1 || timeouts == LAYOUT_MAIN_QUEUE_ATTEMPTS {
+                    warn!(
+                        attempt = timeouts,
+                        max_attempts = LAYOUT_MAIN_QUEUE_ATTEMPTS,
+                        "keyboard layout snapshot: main-queue dispatch timed out"
+                    );
+                }
+                None
+            }
+        }
+    }
 }
 
 fn snapshot_current_layout() -> Option<LayoutSnapshot> {
@@ -3502,6 +3583,38 @@ mod macos_click_attribution_eval;
 mod tests {
     use super::*;
 
+    /// HIToolbox started asserting the main queue for input-source calls in
+    /// macOS 26. Product version, not Darwin: this machine reports 27.2.
+    fn macos_tis_asserts_main_queue() -> bool {
+        if unsafe { libc::pthread_main_np() } != 0 {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let mut len = buf.len();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                b"kern.osproductversion\0".as_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || len == 0 {
+            // Unknown OS. Off the main thread, assume the assert is present
+            // so a direct TIS call cannot SIGTRAP the suite.
+            return true;
+        }
+        let n = len.saturating_sub(1).min(buf.len());
+        let version = std::str::from_utf8(&buf[..n]).unwrap_or("");
+        let major = version
+            .split(['.', '\0'])
+            .next()
+            .and_then(|part| part.parse::<u32>().ok())
+            .unwrap_or(26);
+        major >= 26
+    }
+
     /// The AX observer thread loops on `run_in_mode`. Two of the four results
     /// come back instantly: `Finished` when the mode has no sources or timers
     /// left, and `Stopped` after `CFRunLoopStop`. Looping straight back in on
@@ -3577,6 +3690,17 @@ mod tests {
     /// active layout.
     #[test]
     fn russian_layout_maps_physical_keys_to_cyrillic() {
+        // macOS 26+ HIToolbox traps (`dispatch_assert_queue` → SIGTRAP) when
+        // `TISCreateInputSourceList` runs off the main queue. libtest runs this
+        // on a worker thread and never pumps that queue, so a hop would
+        // deadlock and a direct call would abort the whole suite.
+        if macos_tis_asserts_main_queue() {
+            eprintln!(
+                "skipping russian layout test: TIS input-source calls assert the \
+                 main queue on this OS, and the test harness does not run there"
+            );
+            return;
+        }
         let Some(layout) = owned_layout_for_source_id("com.apple.keylayout.Russian") else {
             panic!("com.apple.keylayout.Russian is not installed");
         };
